@@ -64,23 +64,16 @@ class PrinterClient:
         logger.info(f"Printer {self.device.name} disconnected.")
 
     async def find_characteristics(self):
-        services = {}
+        # Look for the characteristic that can write and notify (typical for NiimBot printers)
         for service in self.transport.client.services:
-            s = []
             for char in service.characteristics:
-                s.append({
-                    "id": char.uuid,
-                    "handle": char.handle,
-                    "properties": char.properties
-                })
-
-            services[service.uuid] = s
-
-        for service_id, characteristics in services.items():
-            if len(characteristics) == 1:  # Check if there's exactly one characteristic
-                props = characteristics[0]['properties']
-                if 'read' in props and 'write-without-response' in props and 'notify' in props:
-                    self.char_uuid = characteristics[0]['id']  # Return the service ID that meets the criteria
+                props = char.properties
+                # Look for a characteristic that can write and notify
+                if 'write-without-response' in props and 'notify' in props:
+                    self.char_uuid = char.uuid
+                    logger.debug(f"Found suitable characteristic: {char.uuid} with properties: {props}")
+                    return
+        
         if not self.char_uuid:
             raise PrinterException("Cannot find bluetooth characteristics.")
 
