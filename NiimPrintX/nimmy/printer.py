@@ -200,7 +200,15 @@ class PrinterClient:
         serial = data[idx: idx + serial_len].decode()
 
         idx += serial_len
-        total_len, used_len, type_ = struct.unpack(">HHB", data[idx:])
+        
+        # Handle case where remaining data is too short
+        remaining_data = data[idx:]
+        if len(remaining_data) >= 5:  # HHB = 2+2+1 = 5 bytes
+            total_len, used_len, type_ = struct.unpack(">HHB", remaining_data)
+        else:
+            logger.warning(f"Short RFID response: {len(remaining_data)} bytes remaining")
+            total_len, used_len, type_ = 0, 0, 0
+            
         return {
             "uuid": uuid,
             "barcode": barcode,
@@ -287,7 +295,20 @@ class PrinterClient:
 
     async def get_print_status(self):
         packet = await self.send_command(RequestCodeEnum.GET_PRINT_STATUS, b"\x01")
-        page, progress1, progress2 = struct.unpack(">HBB", packet.data)
+        
+        # Handle variable response lengths gracefully
+        if len(packet.data) >= 4:
+            page, progress1, progress2 = struct.unpack(">HBB", packet.data)
+        elif len(packet.data) >= 2:
+            # Fallback for shorter responses
+            page = struct.unpack(">H", packet.data[:2])[0]
+            progress1 = packet.data[2] if len(packet.data) > 2 else 0
+            progress2 = packet.data[3] if len(packet.data) > 3 else 0
+        else:
+            # Very short response - assume defaults
+            logger.warning(f"Short print status response: {len(packet.data)} bytes")
+            page, progress1, progress2 = 0, 0, 0
+            
         return {"page": page, "progress1": progress1, "progress2": progress2}
 
     def __del__(self):
