@@ -72,6 +72,52 @@ class LabelPrinter:
         else:
             # No numbers found - return original text
             return text
+    
+    async def get_or_create_connection(self):
+        """Get existing connection or create new one"""
+        global connection_pool, connection_lock
+        
+        with connection_lock:
+            # Check if we have an existing connection
+            if self.printer_model in connection_pool:
+                printer_client = connection_pool[self.printer_model]
+                # Check if connection is still alive
+                if (printer_client.transport.client and 
+                    printer_client.transport.client.is_connected):
+                    logger.debug(f"Reusing existing connection for {self.printer_model}")
+                    return printer_client
+                else:
+                    # Connection is dead, remove from pool
+                    logger.info(f"Removing dead connection for {self.printer_model}")
+                    del connection_pool[self.printer_model]
+        
+        # Need to create new connection
+        logger.info(f"Creating new connection for {self.printer_model}")
+        device = await find_device(self.printer_model)
+        printer_client = PrinterClient(device)
+        
+        if await printer_client.connect():
+            with connection_lock:
+                connection_pool[self.printer_model] = printer_client
+            logger.info(f"Successfully connected to {device.name}")
+            return printer_client
+        else:
+            raise Exception("Failed to connect to printer")
+    
+    def close_all_connections(self):
+        """Close all persistent connections"""
+        global connection_pool, connection_lock
+        
+        with connection_lock:
+            for model, printer_client in connection_pool.items():
+                try:
+                    if (printer_client.transport.client and 
+                        printer_client.transport.client.is_connected):
+                        # Note: This is sync, but we're called from sync context
+                        logger.info(f"Closing connection for {model}")
+                except Exception as e:
+                    logger.warning(f"Error closing connection for {model}: {e}")
+            connection_pool.clear()
         
     def create_timestamped_label(self, text="", timestamp_format="iso8601", width=384, height=230):
         """Create a label with timestamp and optional text
@@ -161,8 +207,7 @@ class LabelPrinter:
         return ImageFont.load_default()
     
     async def print_label_async(self, text="", timestamp_format="iso8601"):
-        """Print a timestamped label"""
-        printer = None
+        """Print a timestamped label using persistent connection"""
         try:
             # Process the input text (extract/add numbers if present)
             processed_text = self.process_text_input(text)
@@ -172,29 +217,23 @@ class LabelPrinter:
             # Create the label image with processed text
             img = self.create_timestamped_label(processed_text, timestamp_format)
             
-            # Connect to printer and print
-            device = await find_device(self.printer_model)
-            printer = PrinterClient(device)
+            # Get or create persistent connection
+            printer = await self.get_or_create_connection()
             
-            if await printer.connect():
-                logger.info(f"Connected to {device.name}")
-                await printer.print_image(img, density=3, quantity=1)
-                logger.info("Print job completed successfully")
-                return {"status": "success", "message": f"Label printed: '{processed_text}' (from input: '{text}')"}
-            else:
-                logger.error("Failed to connect to printer")
-                return {"status": "error", "message": "Failed to connect to printer"}
+            # Print using the persistent connection
+            await printer.print_image(img, density=3, quantity=1)
+            logger.info("Print job completed successfully")
+            return {"status": "success", "message": f"Label printed: '{processed_text}' (from input: '{text}')"}
                 
         except Exception as e:
             logger.error(f"Print job failed: {e}")
+            # If connection failed, remove from pool so next attempt will reconnect
+            global connection_pool, connection_lock
+            with connection_lock:
+                if self.printer_model in connection_pool:
+                    del connection_pool[self.printer_model]
+                    logger.info(f"Removed failed connection for {self.printer_model} from pool")
             return {"status": "error", "message": str(e)}
-        finally:
-            # Always try to disconnect, but don't let it crash the whole operation
-            if printer:
-                try:
-                    await asyncio.wait_for(printer.disconnect(), timeout=2.0)
-                except Exception as disconnect_error:
-                    logger.warning(f"Error during disconnect: {disconnect_error}")
     
     def print_label(self, text="", timestamp_format="iso8601"):
         """Synchronous wrapper for async print function"""
@@ -238,6 +277,10 @@ class LabelPrinter:
 printer = LabelPrinter()
 print_queue = []  # Simple list to track recent jobs
 max_queue_size = 10  # Keep last 10 jobs
+
+# Persistent connection management
+connection_pool = {}  # Model -> PrinterClient mapping
+connection_lock = threading.Lock()  # Thread safety for connection pool
 
 @app.route('/print', methods=['POST'])
 def print_label():
@@ -324,6 +367,26 @@ def queue_status():
         "jobs": print_queue
     })
 
+@app.route('/connections', methods=['GET'])
+def connection_status():
+    """Show persistent connection status"""
+    global connection_pool, connection_lock
+    
+    with connection_lock:
+        connections = {}
+        for model, printer_client in connection_pool.items():
+            is_connected = (printer_client.transport.client and 
+                          printer_client.transport.client.is_connected)
+            connections[model] = {
+                "connected": is_connected,
+                "device_name": printer_client.device.name if hasattr(printer_client, 'device') else "Unknown"
+            }
+    
+    return jsonify({
+        "total_connections": len(connection_pool),
+        "connections": connections
+    })
+
 @app.route('/', methods=['GET'])
 def home():
     """Simple home page with usage instructions"""
@@ -357,14 +420,26 @@ def home():
          -d '{"text": "50mL", "timestamp_format": "friendly"}'
     </pre>
     
-    <p><a href="/queue">📋 View Print Queue (lpq)</a> | <a href="/status">✅ Server Status</a></p>
+    <p><a href="/queue">📋 View Print Queue (lpq)</a> | <a href="/connections">🔗 Bluetooth Connections</a> | <a href="/status">✅ Server Status</a></p>
     </body>
     </html>
     """
     return html
 
 if __name__ == '__main__':
+    import atexit
+    import signal
+    
+    # Register cleanup handler
+    def cleanup():
+        print("\nShutting down gracefully...")
+        printer.close_all_connections()
+    
+    atexit.register(cleanup)
+    signal.signal(signal.SIGINT, lambda s, f: cleanup() or exit(0))
+    
     print("Starting Label Printer API server...")
     print("Access at: http://localhost:8080")
     print("API endpoint: POST /print with optional 'text' parameter")
+    print("Persistent Bluetooth connections enabled for faster printing!")
     app.run(host='0.0.0.0', port=8080, debug=True)
