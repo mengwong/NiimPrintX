@@ -100,3 +100,4 @@ dmypy.json
 .idea
 data/
 nimmy.log
+logs/

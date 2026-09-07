@@ -53,7 +53,8 @@ class BLETransport:
         if self.client is None:
             self.client = BleakClient(address)
         if not self.client.is_connected:
-            return await self.client.connect()
+            await self.client.connect()
+            return self.client.is_connected
         return False
 
     async def disconnect(self):

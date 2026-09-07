@@ -140,7 +140,7 @@ class PrinterClient:
             status = await self.get_print_status()
             if status['page'] == quantity:
                 break
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.5)  # Reduced polling from 10/sec to 2/sec
 
         await self.end_print()
 
@@ -304,9 +304,14 @@ class PrinterClient:
             page = struct.unpack(">H", packet.data[:2])[0]
             progress1 = packet.data[2] if len(packet.data) > 2 else 0
             progress2 = packet.data[3] if len(packet.data) > 3 else 0
+        elif len(packet.data) == 1:
+            # Single byte response - likely status code, treat as page count
+            page = packet.data[0]
+            progress1, progress2 = 0, 0
+            logger.debug(f"Single-byte status response: {page}")
         else:
-            # Very short response - assume defaults
-            logger.warning(f"Short print status response: {len(packet.data)} bytes")
+            # Empty response - printer might be busy
+            logger.debug(f"Empty status response ({len(packet.data)} bytes)")
             page, progress1, progress2 = 0, 0, 0
             
         return {"page": page, "progress1": progress1, "progress2": progress2}

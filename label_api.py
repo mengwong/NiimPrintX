@@ -18,9 +18,13 @@ from NiimPrintX.nimmy.bluetooth import find_device
 from NiimPrintX.nimmy.printer import PrinterClient
 from NiimPrintX.nimmy.logger_config import setup_logger, get_logger
 
-# Setup logging
+# Setup logging (reduce verbosity for production)
 setup_logger()
 logger = get_logger()
+
+# Reduce log noise in production
+import logging
+logging.getLogger().setLevel(logging.INFO)  # Hide DEBUG messages
 
 app = Flask(__name__)
 
@@ -119,9 +123,9 @@ class LabelPrinter:
                     logger.warning(f"Error closing connection for {model}: {e}")
             connection_pool.clear()
         
-    def create_timestamped_label(self, text="", timestamp_format="iso8601", width=384, height=230):
+    def create_timestamped_label(self, text="", timestamp_format="friendly", width=384, height=230):
         """Create a label with timestamp and optional text
-        
+
         Args:
             text: Optional text to display
             timestamp_format: 'iso8601' or 'friendly'
@@ -130,11 +134,10 @@ class LabelPrinter:
         # Create white background
         img = Image.new('RGB', (width, height), 'white')
         draw = ImageDraw.Draw(img)
-        
+
         # Try to load a system font
-        font_large = self._get_font(48)  # For main text (increased from 32)
-        font_small = self._get_font(48)  # For timestamp (doubled from 24)
-        
+        font_large = self._get_font(64)  # For main text (bigger than the timestamp)
+
         # Get current timestamp in requested format
         now = datetime.now()
         if timestamp_format.lower() == "friendly":
@@ -143,7 +146,21 @@ class LabelPrinter:
         else:
             # Default ISO8601 format: "2025-10-16 15:16:04"
             timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
-        
+
+        # Shrink the timestamp font until its widest line fits the label,
+        # instead of a fixed size that clips long formats like iso8601
+        margin = 40
+        lines_to_check = timestamp.split('\n')
+        font_small = self._get_font(32)
+        for size in range(32, 15, -2):
+            font_small = self._get_font(size)
+            widest = max(
+                draw.textbbox((0, 0), line, font=font_small)[2]
+                for line in lines_to_check
+            )
+            if widest <= width - margin:
+                break
+
         # Layout: Main text on top, timestamp on bottom
         y_offset = 35  # Increased top margin from 20 to 35
         
@@ -206,8 +223,9 @@ class LabelPrinter:
         
         return ImageFont.load_default()
     
-    async def print_label_async(self, text="", timestamp_format="iso8601"):
-        """Print a timestamped label using persistent connection"""
+    async def print_label_async(self, text="", timestamp_format="friendly"):
+        """Print a timestamped label with fresh connection per job"""
+        printer_client = None
         try:
             # Process the input text (extract/add numbers if present)
             processed_text = self.process_text_input(text)
@@ -217,25 +235,31 @@ class LabelPrinter:
             # Create the label image with processed text
             img = self.create_timestamped_label(processed_text, timestamp_format)
             
-            # Get or create persistent connection
-            printer = await self.get_or_create_connection()
+            # Create fresh connection for this print job (avoid event loop conflicts)
+            logger.info(f"Creating fresh connection for {self.printer_model}")
+            device = await find_device(self.printer_model)
+            printer_client = PrinterClient(device)
             
-            # Print using the persistent connection
-            await printer.print_image(img, density=3, quantity=1)
-            logger.info("Print job completed successfully")
-            return {"status": "success", "message": f"Label printed: '{processed_text}' (from input: '{text}')"}
+            if await printer_client.connect():
+                logger.info(f"Connected to {device.name}")
+                await printer_client.print_image(img, density=3, quantity=1)
+                logger.info("Print job completed successfully")
+                return {"status": "success", "message": f"Label printed: '{processed_text}' (from input: '{text}')"}
+            else:
+                return {"status": "error", "message": "Failed to connect to printer"}
                 
         except Exception as e:
             logger.error(f"Print job failed: {e}")
-            # If connection failed, remove from pool so next attempt will reconnect
-            global connection_pool, connection_lock
-            with connection_lock:
-                if self.printer_model in connection_pool:
-                    del connection_pool[self.printer_model]
-                    logger.info(f"Removed failed connection for {self.printer_model} from pool")
             return {"status": "error", "message": str(e)}
+        finally:
+            # Always disconnect to avoid stale connections
+            if printer_client:
+                try:
+                    await printer_client.disconnect()
+                except Exception as e:
+                    logger.warning(f"Error during disconnect: {e}")
     
-    def print_label(self, text="", timestamp_format="iso8601"):
+    def print_label(self, text="", timestamp_format="friendly"):
         """Synchronous wrapper for async print function"""
         import threading
         import time
@@ -282,6 +306,9 @@ max_queue_size = 10  # Keep last 10 jobs
 connection_pool = {}  # Model -> PrinterClient mapping
 connection_lock = threading.Lock()  # Thread safety for connection pool
 
+# Removed startup connection to avoid asyncio event loop conflicts
+# Connections will be created on-demand per print job
+
 @app.route('/print', methods=['POST'])
 def print_label():
     """API endpoint to print a label"""
@@ -290,10 +317,10 @@ def print_label():
         if request.is_json:
             data = request.get_json()
             text = data.get('text', '') if data else ''
-            timestamp_format = data.get('timestamp_format', 'iso8601') if data else 'iso8601'
+            timestamp_format = data.get('timestamp_format', 'friendly') if data else 'friendly'
         else:
             text = request.form.get('text', '')
-            timestamp_format = request.form.get('timestamp_format', 'iso8601')
+            timestamp_format = request.form.get('timestamp_format', 'friendly')
         
         # Validate timestamp format
         if timestamp_format not in ['iso8601', 'friendly']:
@@ -402,22 +429,22 @@ def home():
     <form method="post" action="/print">
         <input type="text" name="text" placeholder="Enter label text (optional)"><br><br>
         <label>Timestamp Format:</label><br>
-        <input type="radio" name="timestamp_format" value="iso8601" checked> ISO8601 (2025-10-16 15:16:04)<br>
-        <input type="radio" name="timestamp_format" value="friendly"> Friendly (Thu 16 Oct<br>11:16 PM)<br><br>
+        <input type="radio" name="timestamp_format" value="iso8601"> ISO8601 (2025-10-16 15:16:04)<br>
+        <input type="radio" name="timestamp_format" value="friendly" checked> Friendly (Thu 16 Oct<br>11:16 PM)<br><br>
         <button type="submit">Print Label</button>
     </form>
     
     <h3>API Usage:</h3>
     <pre>
-    # ISO8601 format (default)
+    # Friendly format (default)
     curl -X POST http://localhost:8080/print \\
          -H "Content-Type: application/json" \\
          -d '{"text": "50mL"}'
-    
-    # Friendly format
+
+    # ISO8601 format
     curl -X POST http://localhost:8080/print \\
          -H "Content-Type: application/json" \\
-         -d '{"text": "50mL", "timestamp_format": "friendly"}'
+         -d '{"text": "50mL", "timestamp_format": "iso8601"}'
     </pre>
     
     <p><a href="/queue">📋 View Print Queue (lpq)</a> | <a href="/connections">🔗 Bluetooth Connections</a> | <a href="/status">✅ Server Status</a></p>
@@ -442,4 +469,5 @@ if __name__ == '__main__':
     print("Access at: http://localhost:8080")
     print("API endpoint: POST /print with optional 'text' parameter")
     print("Persistent Bluetooth connections enabled for faster printing!")
+    
     app.run(host='0.0.0.0', port=8080, debug=True)
